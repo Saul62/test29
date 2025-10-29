@@ -200,7 +200,6 @@ def main():
     - 风险分层（低/中/高）
     - SHAP模型解释
 
-    **提示：**请按模型训练口径填写单位与编码。
     """)
     with st.sidebar.expander("变量说明"):
         for f in feature_names_display:
