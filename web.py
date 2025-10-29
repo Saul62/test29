@@ -111,7 +111,7 @@ def _clean_number(x):
 
 @st.cache_resource
 def load_model(model_path: str = './xgb_model.pkl'):
-    """加载 xgboost 模型，兼容旧版训练产物（补 use_label_encoder），并尝试拿到特征名"""
+    """加载 xgboost 模型，兼容旧版训练产物：补 use_label_encoder / gpu_id / n_gpus / predictor 等缺失属性"""
     try:
         try:
             model = joblib.load(model_path)
@@ -119,15 +119,24 @@ def load_model(model_path: str = './xgb_model.pkl'):
             with open(model_path, 'rb') as f:
                 model = pickle.load(f)
 
-        # 🔧 兼容补丁：旧版 xgboost 训练的模型有 use_label_encoder，1.7+ 无此属性时需补上
+        # 🔧 兼容补丁：老版本 XGBoost 训练的模型里常见的已废弃/迁移属性
         try:
             if hasattr(model, "__class__") and model.__class__.__name__.startswith("XGB"):
-                if not hasattr(model, "use_label_encoder"):
-                    setattr(model, "use_label_encoder", False)
+                # 这些属性的存在只为避免 get_params() getattr 报错；值不影响 1.7.6 推理
+                defaults = {
+                    "use_label_encoder": False,   # 1.x 时代参数，2.x 已废弃
+                    "gpu_id": 0,                  # 老版本 GPU 选择；1.7.6 不再需要
+                    "n_gpus": 1,                  # 有些旧代码保存过这个
+                    "predictor": None,            # 旧参数：cpu_predictor/gpu_predictor
+                    "tree_method": getattr(model, "tree_method", None),
+                }
+                for k, v in defaults.items():
+                    if not hasattr(model, k):
+                        setattr(model, k, v)
         except Exception:
             pass
 
-        # 尝试获取特征名
+        # 尝试获取特征名（优先 sklearn 风格，再退 Booster）
         model_feature_names = None
         try:
             if hasattr(model, 'feature_names_in_'):
@@ -145,6 +154,34 @@ def load_model(model_path: str = './xgb_model.pkl'):
         return model, model_feature_names
     except Exception as e:
         raise RuntimeError(f"无法加载模型: {e}")
+
+def predict_proba_safe(model, X_df):
+    """优先用 sklearn predict_proba；失败则补属性重试；仍失败则回退到 booster 直接预测概率"""
+    # 第一次尝试
+    try:
+        return model.predict_proba(X_df)
+    except AttributeError:
+        # 再补一次容错属性（如果模型是从别处传来的）
+        for k, v in {"use_label_encoder": False, "gpu_id": 0, "n_gpus": 1, "predictor": None}.items():
+            if not hasattr(model, k):
+                setattr(model, k, v)
+        return model.predict_proba(X_df)
+    except Exception:
+        # 回退：直接用 booster 预测（要求模型 objective 为二/多分类概率）
+        import xgboost as xgb
+        booster = getattr(model, "get_booster", lambda: None)()
+        if booster is None:
+            raise
+        dm = xgb.DMatrix(X_df.values, feature_names=list(X_df.columns))
+        pred = booster.predict(dm, output_margin=False)
+        # pred 形状：二分类通常 (n,), 多分类 (n, K)
+        if isinstance(pred, np.ndarray):
+            if pred.ndim == 1:  # 二分类概率（正类）
+                proba_pos = pred.astype(float)
+                return np.vstack([1 - proba_pos, proba_pos]).T
+            elif pred.ndim == 2:
+                return pred.astype(float)
+        raise RuntimeError("Booster 预测回退失败：未知输出形状")
 
 # ============== 主逻辑 ==================
 def main():
@@ -246,21 +283,13 @@ def main():
                 st.write(input_df)
             return
 
-        # 预测
+        # ======== 预测 ========
         try:
-            if hasattr(model, 'predict_proba'):
-                proba = model.predict_proba(input_df)[0]
-                if len(proba) == 2:
-                    no_aki_prob = float(proba[0]); aki_prob = float(proba[1])
-                else:
-                    raise ValueError("predict_proba 返回的维度异常")
+            proba = predict_proba_safe(model, input_df)[0]
+            if len(proba) == 2:
+                no_aki_prob = float(proba[0]); aki_prob = float(proba[1])
             else:
-                if hasattr(model, 'decision_function'):
-                    score = float(model.decision_function(input_df))
-                    aki_prob = 1 / (1 + np.exp(-score)); no_aki_prob = 1 - aki_prob
-                else:
-                    pred = int(model.predict(input_df)[0])
-                    aki_prob = float(pred); no_aki_prob = 1 - aki_prob
+                raise ValueError("返回的概率维度异常")
 
             # 展示结果
             st.header("AKI风险预测结果")
