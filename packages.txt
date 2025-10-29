@@ -1,0 +1,5 @@
+libgomp1
+fonts-wqy-zenhei
+fonts-wqy-microhei
+fonts-noto-cjk
+fontconfig
